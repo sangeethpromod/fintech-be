@@ -47,7 +47,6 @@ export async function appendTransactionToSheet(
       },
     });
     
-    console.log(`Transaction ${transaction.transaction_id} added successfully`);
   } catch (error) {
     throw new Error(`Failed to write to Google Sheets: ${error instanceof Error ? error.message : 'Unknown error'}`);
   }
