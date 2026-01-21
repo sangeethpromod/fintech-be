@@ -1,0 +1,31 @@
+# Dependencies
+node_modules
+pnpm-lock.yaml
+
+# Build output
+dist
+*.log
+
+# Git
+.git
+.gitignore
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Testing
+coverage
+.nyc_output
+
+# Misc
+*.md
+.DS_Store
+Dockerfile
+.dockerignore
+
+# CI/CD
+.github
+.gitlab-ci.yml
