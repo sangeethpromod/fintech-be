@@ -24,7 +24,7 @@ export function buildApp() {
   });
 
   app.register(cors, { origin: true });
-  app.register(ingestRoute, { prefix: "/ingest" });
+  app.register(ingestRoute, { prefix: "/api" });
 
   // Health check endpoint
   app.get('/health', { logLevel: 'silent' }, async () => {

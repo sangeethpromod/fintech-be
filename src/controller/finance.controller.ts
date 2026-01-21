@@ -1,6 +1,5 @@
 import { FastifyRequest, FastifyReply } from 'fastify';
-import { parseSMS } from '../lib/smsParser';
-import { classifyTransaction } from '../lib/geminiAgent';
+import { parseTransactionSMS } from '../lib/geminiAgent';
 import { appendTransactionToSheet } from '../lib/sheets';
 
 interface TransactionRequest {
@@ -18,42 +17,28 @@ export async function newTransactionHandler(
       return reply.status(400).send({ error: 'Message is required' });
     }
 
-    // Step 1: Parse SMS
+    // Parse SMS and classify with Gemini
     let parsedTransaction;
     try {
-      parsedTransaction = parseSMS(message);
+      parsedTransaction = await parseTransactionSMS(message);
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'SMS parsing failed';
-      request.log.error({ error: errorMessage }, 'sms_parse_failed');
+      const errorMessage = error instanceof Error ? error.message : 'Transaction parsing failed';
+      request.log.error({ error: errorMessage }, 'transaction_parse_failed');
       return reply.status(400).send({ error: errorMessage });
     }
 
-    // Step 2: Classify with Gemini
-    let classification;
+    // Write to Google Sheets
     try {
-      classification = await classifyTransaction(parsedTransaction);
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Gemini classification failed';
-      request.log.error({ transaction_id: parsedTransaction.transaction_id, error: errorMessage }, 'gemini_classification_failed');
-      return reply.status(500).send({ error: errorMessage });
-    }
-
-    // Step 3: Write to Google Sheets
-    try {
-      await appendTransactionToSheet(parsedTransaction, classification.category);
+      await appendTransactionToSheet(parsedTransaction, parsedTransaction.category);
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Failed to write to sheets';
       request.log.error({ transaction_id: parsedTransaction.transaction_id, error: errorMessage }, 'sheets_write_failed');
       return reply.status(500).send({ error: errorMessage });
     }
 
-    // Step 4: Return response
-    request.log.info({ transaction_id: parsedTransaction.transaction_id, category: classification.category }, 'transaction_ingested');
-    return reply.status(200).send({
-      ...parsedTransaction,
-      category: classification.category,
-      confidence: classification.confidence,
-    });
+    // Return response
+    request.log.info({ transaction_id: parsedTransaction.transaction_id, category: parsedTransaction.category }, 'transaction_ingested');
+    return reply.status(200).send(parsedTransaction);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unexpected error';
     request.log.error({ error: errorMessage }, 'unexpected_error');

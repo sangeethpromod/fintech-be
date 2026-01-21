@@ -26,7 +26,8 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY package.json pnpm-lock.yaml tsconfig.json ./
 COPY src ./src
 
-# Build TypeScript to JavaScript
+# Build TypeScript to JavaScript with increased memory
+ENV NODE_OPTIONS="--max-old-space-size=2048"
 RUN pnpm build
 
 # Install only production dependencies
@@ -54,18 +55,18 @@ COPY --chown=nodejs:nodejs .env* ./
 
 # Set environment variables
 ENV NODE_ENV=production \
-    PORT=3000 \
+    PORT=8080 \
     HOST=0.0.0.0
 
 # Switch to non-root user
 USER nodejs
 
 # Expose port
-EXPOSE 3000
+EXPOSE 8080
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD node -e "require('http').get('http://localhost:3000/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"
+    CMD node -e "require('http').get('http://localhost:8080/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"
 
 # Use dumb-init to handle signals properly
 ENTRYPOINT ["dumb-init", "--"]
