@@ -34,12 +34,13 @@ export async function appendTransactionToSheet(
     transaction.payment_method,       // Column G: payment_method
     transaction.direction,            // Column H: direction
     transaction.created_at,           // Column I: created_at
+    transaction.raw_message,          // Column J: message (raw SMS)
   ];
 
   try {
     await sheets.spreadsheets.values.append({
       spreadsheetId: SHEETS_ID,
-      range: 'Monthly Spending!A:I', // Changed to your actual sheet name
+      range: 'Monthly Spending!A:J', // Updated range to include message column
       valueInputOption: 'USER_ENTERED', // Changed from RAW to handle dates/numbers better
       insertDataOption: 'INSERT_ROWS', // Ensures new rows are inserted
       requestBody: {

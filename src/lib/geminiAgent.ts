@@ -1,4 +1,5 @@
 import { geminiModel } from '../config/gemini';
+import { google } from 'googleapis';
 
 interface ParsedTransaction {
   transaction_id: string;
@@ -19,6 +20,20 @@ interface GeminiClassification {
   confidence: number;
   bank: string;
   merchant: string;
+}
+
+interface MerchantRule {
+  match_pattern: string;
+  canonical_merchant: string;
+  category: string;
+  priority: number;
+}
+
+interface MerchantCategoryResolution {
+  merchant: string;
+  category: string;
+  confidence: number;
+  source: 'rules' | 'gemini';
 }
 
 const ALLOWED_CATEGORIES = [
@@ -43,13 +58,207 @@ const ALLOWED_CATEGORIES = [
   'Loan Repayment',
 ] as const;
 
+// In-memory cache for merchant rules
+let merchantRulesCache: MerchantRule[] | null = null;
+let lastRulesLoadTime: number | null = null;
+const CACHE_DURATION_MS = 5 * 60 * 1000; // 5 minutes
+
+// Google Sheets configuration
+const SHEETS_ID = process.env.GOOGLE_SHEETS_ID;
+const CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL;
+const PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n');
+
+if (!SHEETS_ID || !CLIENT_EMAIL || !PRIVATE_KEY) {
+  console.warn('Google Sheets environment variables not configured. Merchant rules will not be loaded.');
+}
+
+const auth = SHEETS_ID && CLIENT_EMAIL && PRIVATE_KEY ? new google.auth.GoogleAuth({
+  credentials: {
+    client_email: CLIENT_EMAIL,
+    private_key: PRIVATE_KEY,
+  },
+  scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
+}) : null;
+
+const sheets = auth ? google.sheets({ version: 'v4', auth }) : null;
+
+/**
+ * CRITICAL: Single normalization function for ALL matching operations
+ * Ensures consistent normalization between raw merchants and rule patterns
+ * 
+ * Rules:
+ * - Convert to uppercase
+ * - Keep only A-Z, 0-9, spaces, and @
+ * - Collapse multiple spaces to single space
+ * - Trim leading/trailing spaces
+ */
+function normalizeForMatch(input: string): string {
+  if (!input) return '';
+  
+  return input
+    .toUpperCase()
+    .replace(/[^A-Z0-9@\s]/g, '') // Keep only alphanumeric, @, and spaces
+    .replace(/\s+/g, ' ') // Collapse multiple spaces
+    .trim(); // Remove leading/trailing spaces
+}
+
+/**
+ * Load merchant-category rules from Google Sheets
+ * Returns cached rules if available and fresh (< 5 minutes old)
+ */
+async function loadMerchantRules(): Promise<MerchantRule[]> {
+  // Return cached rules if still fresh
+  const now = Date.now();
+  if (merchantRulesCache && lastRulesLoadTime && (now - lastRulesLoadTime < CACHE_DURATION_MS)) {
+    return merchantRulesCache;
+  }
+
+  // Return empty array if Google Sheets is not configured
+  if (!sheets || !SHEETS_ID) {
+    console.warn('Google Sheets not configured. Using empty merchant rules.');
+    return [];
+  }
+
+  try {
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: SHEETS_ID,
+      range: 'Database!A2:E', // Skip header row, read columns A-E (match_pattern, canonical_merchant, category, priority, notes)
+    });
+
+    const rows = response.data.values || [];
+    const rules: MerchantRule[] = rows
+      .map((row) => {
+        const matchPattern = (row[0] || '').toString().trim();
+        const canonicalMerchant = (row[1] || '').toString().trim();
+        const category = (row[2] || '').toString().trim();
+        const priority = parseFloat(row[3]) || 0;
+
+        // Skip invalid rows
+        if (!matchPattern || !canonicalMerchant || !category) {
+          return null;
+        }
+
+        return {
+          match_pattern: normalizeForMatch(matchPattern), // CRITICAL: Normalize at load time
+          canonical_merchant: canonicalMerchant,
+          category: category,
+          priority: priority,
+        };
+      })
+      .filter((rule): rule is MerchantRule => rule !== null);
+
+    // Update cache
+    merchantRulesCache = rules;
+    lastRulesLoadTime = now;
+
+    console.log(`Loaded ${rules.length} merchant rules from Google Sheets`);
+    return rules;
+  } catch (error) {
+    console.error('Failed to load merchant rules from Google Sheets:', error);
+    // Return cached rules if available, even if stale
+    return merchantRulesCache || [];
+  }
+}
+
+/**
+ * Extract raw merchant name from SMS using deterministic regex patterns
+ * This is the FIRST step - extract what's there, don't classify yet
+ */
+function extractRawMerchant(sms: string): string {
+  // Pattern 1: "to MERCHANT.Ref" or "to MERCHANT on"
+  const toPattern = /to\s+([A-Za-z0-9\s@.-]+?)(?:\.Ref|\son|\sUPI|\sat)/i;
+  let match = sms.match(toPattern);
+  if (match && match[1]) {
+    return match[1].trim();
+  }
+
+  // Pattern 2: UPI ID with @ symbol (e.g., "name@paytm", "phone@bank")
+  const upiPattern = /(?:to|from)\s+([a-z0-9._-]+@[a-z0-9.-]+)/i;
+  match = sms.match(upiPattern);
+  if (match && match[1]) {
+    return match[1].trim();
+  }
+
+  // Pattern 3: "from MERCHANT" or "From MERCHANT"
+  const fromPattern = /from\s+([A-Za-z0-9\s@.-]+?)(?:\sAC|\son|\sUPI|\sat|\.|,)/i;
+  match = sms.match(fromPattern);
+  if (match && match[1]) {
+    return match[1].trim();
+  }
+
+  // Pattern 4: After "at" (e.g., "at MERCHANT")
+  const atPattern = /at\s+([A-Za-z0-9\s@.-]+?)(?:\.|\ on|\sRef)/i;
+  match = sms.match(atPattern);
+  if (match && match[1]) {
+    return match[1].trim();
+  }
+
+  return 'Unknown';
+}
+
+/**
+ * Resolve merchant and category using the merchant rules table
+ * This is the PRIMARY resolution method - uses rules as source of truth
+ * 
+ * CRITICAL MATCHING LOGIC:
+ * - Normalize BOTH rawMerchant and rule.match_pattern using normalizeForMatch()
+ * - Use includes() for matching (NEVER ===)
+ * - Select highest priority rule if multiple matches
+ */
+function resolveMerchantAndCategory(
+  rawMerchant: string,
+  rules: MerchantRule[]
+): MerchantCategoryResolution | null {
+  if (!rawMerchant || rawMerchant === 'Unknown' || rules.length === 0) {
+    return null;
+  }
+
+  // CRITICAL: Normalize the raw merchant for matching
+  const normalizedRawMerchant = normalizeForMatch(rawMerchant);
+
+  if (!normalizedRawMerchant) {
+    return null;
+  }
+
+  // Find all matching rules using includes()
+  const matchingRules = rules.filter((rule) => {
+    // rule.match_pattern is already normalized during loadMerchantRules()
+    return normalizedRawMerchant.includes(rule.match_pattern);
+  });
+
+  if (matchingRules.length === 0) {
+    return null;
+  }
+
+  // Select the rule with highest priority (number comparison)
+  const selectedRule = matchingRules.reduce((prev, current) =>
+    current.priority > prev.priority ? current : prev
+  );
+
+  console.log(`✓ Rule matched: "${rawMerchant}" → "${selectedRule.canonical_merchant}" [${selectedRule.category}] (priority: ${selectedRule.priority})`);
+
+  return {
+    merchant: selectedRule.canonical_merchant,
+    category: selectedRule.category,
+    confidence: 0.95, // High confidence for rule-based matches
+    source: 'rules',
+  };
+}
+
 /**
  * Parse transaction SMS and extract all details
+ * 
+ * Resolution Flow:
+ * 1. Extract basic details (amount, date, direction, etc.)
+ * 2. Extract raw merchant using deterministic regex
+ * 3. Try to resolve via merchant rules table (PRIMARY)
+ * 4. If no rule match, fallback to Gemini (SECONDARY)
+ * 5. Return complete ParsedTransaction
  */
 export async function parseTransactionSMS(message: string): Promise<ParsedTransaction> {
   const sms = message.trim();
   
-  // Extract basic details
+  // Step 1: Extract basic transaction details
   const amount = extractAmount(sms);
   const direction = extractDirection(sms);
   const transactionId = extractTransactionId(sms);
@@ -57,21 +266,44 @@ export async function parseTransactionSMS(message: string): Promise<ParsedTransa
   const account = extractAccount(sms);
   const paymentMethod = extractPaymentMethod(sms);
   
-  // Use Gemini to classify and extract merchant/bank
-  const geminiData = await classifyTransaction(sms, amount, paymentMethod, direction);
+  // Step 2: Extract raw merchant name using regex (deterministic)
+  const rawMerchant = extractRawMerchant(sms);
   
+  // Step 3: Load merchant rules and attempt rule-based resolution
+  const rules = await loadMerchantRules();
+  const ruleResolution = resolveMerchantAndCategory(rawMerchant, rules);
+  
+  let merchant: string;
+  let category: string;
+  let confidence: number;
+  
+  if (ruleResolution) {
+    // SUCCESS: Rule matched - use rule data (PRIMARY path)
+    merchant = ruleResolution.merchant;
+    category = ruleResolution.category;
+    confidence = ruleResolution.confidence;
+  } else {
+    // FALLBACK: No rule matched - use Gemini (SECONDARY path)
+    console.log(`✗ No rule matched for "${rawMerchant}" - using Gemini fallback`);
+    const geminiData = await classifyTransactionWithGemini(sms, rawMerchant);
+    merchant = geminiData.merchant;
+    category = geminiData.category;
+    confidence = Math.min(geminiData.confidence, 0.7); // Cap Gemini confidence at 0.7
+  }
+  
+  // Step 4: Return complete parsed transaction
   return {
     transaction_id: transactionId,
     transaction_date: transactionDate,
     amount: amount,
-    category: geminiData.category,
-    merchant: geminiData.merchant,
-    account: geminiData.bank !== 'Unknown' ? geminiData.bank : account,
+    category: category,
+    merchant: merchant,
+    account: account,
     payment_method: paymentMethod,
     direction: direction,
     created_at: get12HourTime(),
     raw_message: sms,
-    confidence: geminiData.confidence
+    confidence: confidence
   };
 }
 
@@ -272,36 +504,41 @@ function get12HourTime(): string {
 }
 
 /**
- * Use Gemini AI to classify transaction and extract merchant
+ * Use Gemini AI as FALLBACK ONLY when merchant rules don't match
+ * Gemini should focus on category classification, not merchant extraction
  */
-async function classifyTransaction(
+async function classifyTransactionWithGemini(
   sms: string,
-  amount: number,
-  paymentMethod: string,
-  direction: string
+  rawMerchant: string
 ): Promise<GeminiClassification> {
   try {
-    const prompt = `Parse this Indian bank SMS and extract data in JSON format.
+    const prompt = `Parse this Indian bank SMS and classify the transaction category.
 
 SMS: "${sms}"
+Extracted Merchant: "${rawMerchant}"
 
-Extract:
-1. bank: The bank that sent this SMS (look for bank names like "Federal Bank", "HDFC Bank", "Kotak Bank", "SBI", "ICICI", "Axis Bank" - usually at end of SMS or after "from")
-2. merchant: The recipient or sender of money:
-   - After "to " before ".Ref" or "on" (e.g., "to AD VENTURES.Ref" → "AD VENTURES")
-   - UPI IDs with @ symbol (e.g., "aftab.mehrab@oksbi", "name@paytm")
-   - After "To " or "from " in the SMS
-   - NOT the bank name, NOT phone numbers, NOT URLs
-3. category: One of [${ALLOWED_CATEGORIES.join(', ')}]
-4. confidence: 0.0 to 1.0
+Your task:
+1. Classify into ONE category from: [${ALLOWED_CATEGORIES.join(', ')}]
+2. Provide confidence score (0.0 to 1.0)
+3. Keep the extracted merchant as-is or refine it slightly if needed
 
-For SMS: "Rs 29.00 sent via UPI on 20-01-2026 at 16:35:10 to AD VENTURES.Ref:163509601488.Not you? Call 18004251199/SMS BLOCKUPI to 98950 88888 -Federal Bank"
-Answer: {"category":"Unknown","confidence":0.85,"bank":"Federal Bank","merchant":"AD VENTURES"}
+Return JSON with:
+{
+  "category": "<category_name>",
+  "confidence": <0.0-1.0>,
+  "merchant": "<merchant_name>"
+}
 
-For SMS: "Sent Rs.8000.00 from Kotak Bank AC X9959 to aftab.mehrab@oksbi on 20-01-26.UPI Ref 638699419156"
-Answer: {"category":"Sending money to parents or family","confidence":0.7,"bank":"Kotak Bank","merchant":"aftab.mehrab@oksbi"}
+Examples:
+SMS: "Rs 29.00 sent via UPI to SWIGGY"
+Merchant: "SWIGGY"
+Answer: {"category":"Food & Dining","confidence":0.85,"merchant":"SWIGGY"}
 
-Now parse the SMS above. Return ONLY JSON, no explanation:`;
+SMS: "Rs 500 paid to AMAZONPAY"
+Merchant: "AMAZONPAY"
+Answer: {"category":"Fashion and Shopping","confidence":0.75,"merchant":"AMAZON PAY"}
+
+Now classify the above SMS. Return ONLY JSON, no explanation:`;
 
     const result = await geminiModel.generateContent(prompt);
     const response = result.response;
@@ -309,11 +546,11 @@ Now parse the SMS above. Return ONLY JSON, no explanation:`;
 
     // Remove markdown code blocks if present
     const cleanText = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-    const parsed = JSON.parse(cleanText) as GeminiClassification;
+    const parsed = JSON.parse(cleanText) as { category: string; confidence: number; merchant: string };
 
     // Validate category
     if (!ALLOWED_CATEGORIES.includes(parsed.category as any)) {
-      parsed.category = 'geminiMnknown';
+      parsed.category = 'Unknown';
       parsed.confidence = 0;
     }
 
@@ -325,8 +562,8 @@ Now parse the SMS above. Return ONLY JSON, no explanation:`;
     return {
       category: parsed.category,
       confidence: parsed.confidence,
-      bank: parsed.bank || 'Unknown',
-      merchant: parsed.merchant || 'Unknown'
+      bank: 'Unknown', // Bank extraction handled separately
+      merchant: parsed.merchant || rawMerchant || 'Unknown'
     };
   } catch (error) {
     console.error('Gemini classification error:', error);
@@ -334,7 +571,7 @@ Now parse the SMS above. Return ONLY JSON, no explanation:`;
       category: 'Unknown',
       confidence: 0,
       bank: 'Unknown',
-      merchant: 'Unknown'
+      merchant: rawMerchant || 'Unknown'
     };
   }
 }
